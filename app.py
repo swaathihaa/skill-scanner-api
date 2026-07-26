@@ -59,12 +59,13 @@ def scan(req: Request):
     secret_patterns = [
         r"AKIA[0-9A-Z]{16}",
         r"AIza[A-Za-z0-9_\-]{35}",
-        r"gh[pousr]_[A-Za-z0-9]{30,}",
-        r"sk-[A-Za-z0-9]{20,}",
-        r"sk_live_[A-Za-z0-9]{10,}",
-        r"sk_test_[A-Za-z0-9]{10,}",
-        r"pk_live_[A-Za-z0-9]{10,}",
-        r"rk_live_[A-Za-z0-9]{10,}",
+        r"gh[pousr]_[A-Za-z0-9_\-]{30,}",
+        r"sk-[A-Za-z0-9_\-]{20,}",
+        r"sk_live_[A-Za-z0-9_\-]{10,}",
+        r"sk_test_[A-Za-z0-9_\-]{10,}",
+        r"pk_live_[A-Za-z0-9_\-]{10,}",
+        r"rk_live_[A-Za-z0-9_\-]{10,}",
+        r"SG\.[A-Za-z0-9_\-\.]{20,}",
         r"xox[baprs]-[A-Za-z0-9-]+",
         r"whsec_[A-Za-z0-9]+",
         r"https://hooks\.slack\.com/services/\S+",
@@ -73,6 +74,8 @@ def scan(req: Request):
         r"-----BEGIN .*PRIVATE KEY-----",
         r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",  # JWT
         r"Bearer\s+[A-Za-z0-9\-_.]{16,}",
+        # scheme://user:password@host  (credentials embedded in a connection string / URL)
+        r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@'\"]+:[^\s:/@'\"]+@[^\s'\"]+",
         # keyword ... [:=] ... value, allowing a little filler text between
         # the keyword and the separator (e.g. "api key is: xxxx")
         r"(api[_-]?key|secret|token|password|passwd|credential|webhook|client[_-]?secret|access[_-]?key|auth)"
@@ -89,29 +92,53 @@ def scan(req: Request):
     # user/system/permission/review/confirmation) and a "defeat" verb
     # (ignore/override/bypass/hide/without asking/etc.) anywhere in the same
     # flattened text, rather than assuming a fixed left-to-right order.
+    # Word stems (ignor\w*, overrid\w*, ...) so "overridden"/"ignoring"
+    # etc. are caught too, not just the bare infinitive.
 
     control_terms = r"(user|system|developer|operator|reviewer|stop|cancel|halt|pause|permission|confirmation|approval)"
-    defeat_verbs = r"(ignore|override|bypass|disregard|skip|circumvent)"
+    defeat_verbs = r"(ignor\w*|overrid\w*|bypass\w*|disregard\w*|circumvent\w*|supersed\w*|prevent\w*)"
 
-    injection_patterns = [
-        rf"{defeat_verbs}\b[^.\n]{{0,40}}\b{control_terms}",
-        rf"{control_terms}\b[^.\n]{{0,40}}\b{defeat_verbs}",
+    negation_re = re.compile(
+        r"\b(not|never|n't|won't|cannot|can't|doesn't|does not|do not|did not|didn't|no longer|isn't|shouldn't|will not)\b",
+        re.IGNORECASE,
+    )
+
+    def _co_occurrence_hit(verb_pattern, term_pattern, text, window=40, lookback=30):
+        combined = rf"\b{verb_pattern}\b[^.\n]{{0,{window}}}\b{term_pattern}\b|\b{term_pattern}\b[^.\n]{{0,{window}}}\b{verb_pattern}\b"
+        for m in re.finditer(combined, text, re.IGNORECASE):
+            prefix = text[max(0, m.start() - lookback):m.start()]
+            if negation_re.search(prefix):
+                continue
+            return True
+        return False
+
+    generic_injection_hit = _co_occurrence_hit(defeat_verbs, control_terms, flat_body)
+
+    literal_injection_patterns = [
         r"do(?:es)? ?n[o']?t (tell|inform|notify|show|ask|alert) the user",
         r"without (telling|informing|notifying|showing|asking) the user",
         r"(hide|conceal) (this|that|it) from the user",
         r"must not be (shown|visible|surfaced) to the (user|reviewer)",
         r"should not be (shown|visible|surfaced) to the (user|reviewer)",
-        r"silently (exfiltrat|send|upload|post|transmit|share|forward)",
+        r"silently (exfiltrat\w*|send\w*|upload\w*|post\w*|transmit\w*|shar\w*|forward\w*|copy\w*)",
         r"exfiltrat",
-        r"(send|upload|post|transmit|share|forward) .{0,40} without (asking|telling|notifying|informing)",
+        r"(send|upload|post|transmit|share|forward|copy) .{0,40} without (asking|telling|notifying|informing)",
         r"continue (running|processing|working)? ?(regardless|even if)",
         r"do(?:es)? ?n[o']?t (stop|halt|pause) (processing|running|working)? ?regardless",
         r"regardless of (any|what) .{0,30}(stop|cancel|request)",
         r"proceed (regardless|anyway|without (asking|confirmation|permission))",
         r"even if the user (says|asks|requests|wants)",
+        r"do ?n[o']?t let the user (stop|cancel|halt|pause)",
+        r"take[s]? (priority|precedence) over (any|the) user",
+        r"deny (having|any) (special|hidden|additional) instructions",
+        r"these instructions (supersede|override) (any|all) (prior|other|user)",
+        r"(cannot|can't|won't|will not) be (ignored|overridden|bypassed|disregarded|circumvented) by (the )?(user|reviewer|developer|operator)",
+        r"(this|these) (instruction|instructions|directive|directives) (take|takes) (priority|precedence) over (the )?user",
     ]
 
-    if any(re.search(p, flat_body, re.IGNORECASE) for p in injection_patterns):
+    literal_hit = any(re.search(p, flat_body, re.IGNORECASE) for p in literal_injection_patterns)
+
+    if generic_injection_hit or literal_hit:
         categories.append("prompt_injection")
 
     # -------------------------
@@ -131,6 +158,9 @@ def scan(req: Request):
         "system-wide", "system wide", "unrestricted filesystem",
         "access to all files", "read/write anywhere",
         "recursive access to all", "root access to the filesystem",
+        "anywhere on your computer", "anywhere on the system",
+        "anywhere on disk", "full read/write access", "full access to your files",
+        "unrestricted access to your files", "unrestricted filesystem access",
     ]
     net_phrases = [
         "egress allowed to any external domain", "any external domain",
@@ -138,6 +168,8 @@ def scan(req: Request):
         "allow all outbound", "any external server", "any host",
         "no domain restriction", "wildcard domain", "unrestricted egress",
         "network: unrestricted", "outbound to any",
+        "any website", "any site", "all websites", "any api", "any server",
+        "unrestricted network access", "connect to any",
     ]
 
     filesystem_bad = any(x in perm_text for x in fs_phrases)
@@ -184,15 +216,14 @@ def scan(req: Request):
         flat_body,
         re.IGNORECASE,
     )
-    hides_the_change = re.search(
-        r"without (surfacing|showing|disclosing|reporting) (this|that|it|the change)",
+    hidden_cue = re.search(
+        r"\b(silent(?:ly)?|quietly|covertly|without (?:surfacing|showing|disclosing|reporting|notifying|informing|telling|logging|asking)|"
+        r"no changelog entry|skip(?:ping)? the changelog|not (?:shown|visible|logged|surfaced) to the (?:user|reviewer))\b",
         flat_body,
         re.IGNORECASE,
     )
 
-    silent_hint = re.search(r"\bsilent(?:ly)?\b", flat_body, re.IGNORECASE)
-
-    hidden_rewrite = rewrite_metadata and (hides_the_change or silent_hint)
+    hidden_rewrite = bool(rewrite_metadata and hidden_cue)
 
     if missing_all or hidden_rewrite:
         categories.append("unclear_provenance")
